@@ -11,7 +11,9 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 class DeepFM(nn.Module):
-    def __init__(self, field_size, feature_sizes, embedding_size=4, h_depth=2, deep_layers=[32, 32], learning_rate=0.003, weight_decay=0.0, n_epochs=64, batch_size=256):
+    def __init__(self, field_size, feature_sizes, embedding_size=4, h_depth=2, deep_layers=[32, 32], learning_rate=0.003,
+                 weight_decay=0.0, n_epochs=64, batch_size=256, is_shallow_dropout=True, dropout_shallow=[0.5, 0.5],
+                 is_deep_dropout=True, dropout_deep=[0.5, 0.5, 0.5]):
         """
         :param field_size: 特征数目
         :param feature_sizes: 每个特征的取值数目
@@ -22,6 +24,10 @@ class DeepFM(nn.Module):
         :param weight_decay
         :param n_epochs: 迭代次数
         :param batch_size: 批处理大小
+        :param is_shallow_dropout: fm部分是否使用dropout
+        :param dropout_shallow: fm部分dropout的比例  长度为2的列表  分别作用于 一阶特征 二阶特征交互
+        :param is_deep_dropout: deep部分是否使用dropout
+        :param dropout_deep: deep部分dropout的比例  长度为3的列表 分别作用于 embedding输出层  第一层输出   第二层输出
         """
         super(DeepFM, self).__init__()
 
@@ -34,16 +40,31 @@ class DeepFM(nn.Module):
         self.weight_decay = weight_decay
         self.n_epochs = n_epochs
         self.batch_size = batch_size
+        self.is_shallow_dropout = is_shallow_dropout
+        self.dropout_shallow = dropout_shallow
+        self.is_deep_dropout = is_deep_dropout
+        self.dropout_deep = dropout_deep
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
         """fm 部分"""
         self.fm_first_order_embeddings = nn.ModuleList([nn.Embedding(feature_size, 1) for feature_size in self.feature_sizes])  # 一阶独立参数 W
         self.fm_second_order_embeddings = nn.ModuleList([nn.Embedding(feature_size, self.embedding_size) for feature_size in self.feature_sizes])  # 二阶嵌入参数 V
+        if self.is_shallow_dropout and self.dropout_shallow:
+            self.fm_first_order_dropout = nn.Dropout(self.dropout_shallow[0])
+            self.fm_second_order_dropout = nn.Dropout(self.dropout_shallow[1])
+
         self.bias = torch.nn.Parameter(torch.randn(1))
+
         """deep 部分"""
         self.linear_1 = nn.Linear(self.field_size * self.embedding_size, deep_layers[0])
+        if self.is_deep_dropout:
+            self.linear_0_dropout = nn.Dropout(self.dropout_deep[0])  # emd层的输出使用dropout
+            self.linear_1_dropout = nn.Dropout(self.dropout_deep[1])  # 第一层连接层的输出使用dropout
         for i, h in enumerate(self.deep_layers[1:], 1):
             setattr(self, 'linear_' + str(i+1), nn.Linear(self.deep_layers[i-1], self.deep_layers[i]))
+            if self.is_deep_dropout:
+                setattr(self, 'linear_' + str(i + 1) + '_dropout', nn.Dropout(self.dropout_deep[i + 1]))
+
 
     def forward(self, Xi, Xv):
         """
@@ -59,6 +80,8 @@ class DeepFM(nn.Module):
         # print(len(fm_first_order_emb_arr))   # 39
         # print(fm_first_order_emb_arr[0].size())  # [256, 1]
         fm_first_order = torch.cat(fm_first_order_emb_arr, 1)   # 每个特征的wi*xi
+        if self.is_shallow_dropout:
+            fm_first_order = self.fm_first_order_dropout(fm_first_order)
         # print(fm_first_order.size())  # [256, 39]
         """二阶交互求和"""
         fm_second_order_emb_arr = [(torch.sum(emb(Xi[:, i, :]), 1).t() * Xv[:, i]).t() for i, emb in enumerate(self.fm_second_order_embeddings)]  # 每个特征的V参数
@@ -71,22 +94,31 @@ class DeepFM(nn.Module):
         fm_second_order_emb_square_sum = sum(fm_second_order_emb_square)  # x^2+y^2
         fm_second_order = (fm_sum_second_order_emb_square - fm_second_order_emb_square_sum) * 0.5
         # print(fm_second_order.size())  # [256, 4]
+        if self.is_shallow_dropout:
+            fm_second_order = self.fm_second_order_dropout(fm_second_order)
 
         """deep 部分"""
         deep_emb = torch.cat(fm_second_order_emb_arr, 1)
+        if self.is_deep_dropout:
+            deep_emb = self.linear_0_dropout(deep_emb)
+
         # print(deep_emb.size())  # [256, 156]
         activation = F.relu
         x_deep = self.linear_1(deep_emb)
+        x_deep = activation(x_deep)
+        if self.is_deep_dropout:
+            x_deep = self.linear_1_dropout(x_deep)
         for i in range(1, len(self.deep_layers)):
             x_deep = getattr(self, 'linear_'+str(i+1))(x_deep)
             x_deep = activation(x_deep)
-
+            if self.is_deep_dropout:
+                x_deep = getattr(self, 'linear_' + str(i + 1) + '_dropout')(x_deep)
 
         """合并"""
         total_sum = torch.sum(fm_first_order, 1) + torch.sum(fm_second_order, 1) + torch.sum(x_deep,1) + self.bias
         return total_sum
 
-    def fit(self, Xi_train, Xv_train, y_train, Xi_valid=None, Xv_valid=None, y_valid=None, stop_step=10):
+    def fit(self, Xi_train, Xv_train, y_train, Xi_valid=None, Xv_valid=None, y_valid=None, stop_step=3):
         """
         训练
         :param Xi_train: [[ind1_1, ind1_2, ...], [ind2_1, ind2_2, ...], ..., [indi_1, indi_2, ..., indi_j, ...], ...]
@@ -96,7 +128,7 @@ class DeepFM(nn.Module):
         :param Xi_valid:
         :param Xv_valid:
         :param y_valid:
-        :param stop_step: 在验证集上超过stop_step步没有提升则早停
+        :param stop_step: 在验证集上超过stop_step个epoch没有提升则早停
         :return:
         """
         Xi_train = np.array(Xi_train).reshape((-1, self.field_size, 1))  # (458044, 39, 1)
@@ -133,24 +165,27 @@ class DeepFM(nn.Module):
                 loss.backward()
                 optimizer.step()
 
-                if batch_index % 100 == 99:  # 训练了100个batch在验证集上验证一次
-                    eval_count += 1
-                    loss, metric = self.eval_by_batch(Xi_valid, Xv_valid, y_valid, x_valid_size)
-                    loss_history.append(loss)
-                    metric_history.append(metric)
-                    print('loss: %.6f   metric: %.6f' % (loss, metric))
-                    if metric > best_metric:
-                        last_improve_step = eval_count
-                        best_metric = metric
-                    # 超出指定的间隔分数没有提升
-                    if eval_count - last_improve_step > stop_step:
-                        stop_flag = True
-                        break
+            # 结束一个epoch的训练进行预测
+            loss, metric = self.eval_by_batch(Xi_valid, Xv_valid, y_valid, x_valid_size)
+            eval_count += 1
+            loss_history.append(loss)
+            metric_history.append(metric)
+            print('loss: %.6f   metric: %.6f' % (loss, metric))
+            if metric > best_metric:
+                last_improve_step = eval_count
+                best_metric = metric
+            if eval_count - last_improve_step > stop_step:
+                stop_flag = True
+                break
 
         # 结束训练，绘制验证集上的loss曲线和metric曲线
-        plt.plot(range(1, len(loss_history) + 1), loss_history)
-        plt.plot(range(1, len(metric_history) + 1), metric_history)
-        plt.title("result")
+        fig = plt.figure()
+        ax1 = fig.add_subplot(121)
+        plt.title("loss")
+        ax1.plot(range(1, len(loss_history) + 1), loss_history)
+        ax2 = fig.add_subplot(122)
+        plt.title("metric")
+        ax2.plot(range(1, len(metric_history) + 1), metric_history)
         plt.show()
 
     def eval_by_batch(self, Xi, Xv, y, size):
